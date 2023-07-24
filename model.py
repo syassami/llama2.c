@@ -38,14 +38,11 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
+    return freqs
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
@@ -58,13 +55,23 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    xq_r, xq_i = xq.float().reshape(*xq.shape[:-1], -1, 2).unbind(-1)
+    xk_r, xk_i = xk.float().reshape(*xk.shape[:-1], -1, 2).unbind(-1)
+
+    freqs = reshape_for_broadcast(freqs, xq_r)
+    cos_freqs = freqs.cos()
+    sin_freqs = freqs.sin()
+
+    xq_out_r = cos_freqs * xq_r - sin_freqs * xq_i
+    xq_out_i = cos_freqs * xq_i + sin_freqs * xq_r
+    xq_out = torch.stack((xq_out_r, xq_out_i), dim=-1).flatten(3)
+
+    xk_out_r = cos_freqs * xk_r - sin_freqs * xk_i
+    xk_out_i = cos_freqs * xk_i + sin_freqs * xk_r
+    xk_out = torch.stack((xk_out_r, xk_out_i), dim=-1).flatten(3)
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -179,8 +186,9 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cis):
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cis)
+    def forward(self, x, freqs):
+        h = x + self.attention.forward(self.attention_norm(x), freqs)
+        # h = x + self.attention.forward(self.attention_norm(x), freqs_cis)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
@@ -204,9 +212,10 @@ class Transformer(nn.Module):
         self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings. TODO why * 2 here? confuse
-        freqs_cis = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len * 2)
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
-        
+        # freqs_cis = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len * 2)
+        # self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        freqs = precompute_freqs(self.params.dim // self.params.n_heads, self.params.max_seq_len * 2)
+        self.register_buffer("freqs", freqs, persistent=False)
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -226,10 +235,10 @@ class Transformer(nn.Module):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
-        freqs_cis = self.freqs_cis[:seqlen]
+        freqs = self.freqs[:seqlen]
 
         for layer in self.layers:
-            h = layer(h, freqs_cis)
+            h = layer(h, freqs)
         h = self.norm(h)
 
         if targets is not None:
@@ -362,8 +371,7 @@ class Transformer(nn.Module):
         serialize(self.norm.weight)
         # note: no need to write final classifier weights due to weight sharing
         # freqs_cis
-        serialize(self.freqs_cis.real[:p.max_seq_len])
-        serialize(self.freqs_cis.imag[:p.max_seq_len])
+        serialize(self.freqs[:p.max_seq_len])
 
         # write to binary file
         f.close()
